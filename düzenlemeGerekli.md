@@ -1,48 +1,104 @@
-# Düzenleme ve Optimizasyon Gereksinimleri
+# Yeni Proje Taslağı: AI Odaklı Optimizasyon ve CPU Verimliliği
 
-Aşağıdaki maddeler, depodaki kodu incelerken tespit edilen bakım ve performans konularını özetler. Her bölümde ilgili dosya, sorun/iyileştirme alanı ve beklenen kazanç belirtilmiştir.
+Bu doküman, mevcut kod tabanından bağımsız olarak **sıfırdan** inşa edilecek, AI davranışlarını ve CPU verimliliğini merkeze alan yeni oyunsal simülasyon projesinin gereksinimlerini ve teknik yol haritasını tarif eder.
 
-## renderers/connection/connection_renderer.lua
-- **Sorun:** `ConnectionRenderer:_update` içinde vurgulama adımı TODO olarak devre dışı bırakılmış. UI mod değiştiğinde bağlayıcıların görsel durumu güncellenmediği için oyuncular bağlantı durumunu takip etmekte zorlanıyor.
-- **İhtiyaç:** `self:_do_hilight_check()` çağrısını yeniden etkinleştirip hatalı aydınlatmayı düzeltmek veya alternatif bir görsel geri bildirim geliştirmek.
-- **Beklenen Kazanç:** Görsel netlik artışı ve bağlantı hatalarının daha hızlı fark edilmesi.
+## 1. Ürün Vizyonu
+- **Odak:** Büyük ölçekli kolonilerde görev planlaması ve çevresel simülasyonları akıcı biçimde çalıştıran, AI kararlarını gerçek zamanlı optimize eden bir çekirdek.
+- **Hedef Platform:** Çok çekirdekli masaüstü CPU'lar, isteğe bağlı düşük güçlü taşınabilir cihaz desteği.
+- **Ölçülebilir Başarı Kriterleri:**
+  - 200+ aktif ajan için ortalama tik süresi ≤ 33 ms.
+  - Görev kuyruğu gecikmesi (iş seçme → icra başlangıcı) < 500 ms.
+  - AI planlama hatasında %5'in altında sapma (beklenen hedefe ulaşamayan görev sayısı / tüm görevler).
 
-## components/auto_craft/auto_craft_component.lua
-- **Sorun:** Bileşen, oyuncu kimliği değişimini, aktif sipariş iptallerini ve tarif etkinlik durumlarını yönetmiyor; ayrıca görev deposuyla entegrasyon tamamlanmamış. Kod içinde kapsamlı TODO listesi bulunuyor.
-- **İhtiyaç:** Bileşene olay dinleyicileri ve durum geçişleri ekleyerek kimlik değişimleri, iptal edilen siparişler ve tarif etkinliği senaryolarını ele almak; görev deposunu ayrı bir varlıkla ayrıştırmak.
-- **Beklenen Kazanç:** Otomatik üretim atölyelerinin hatasız ve tasarlanan şekilde çalışması.
+## 2. Sistem Bileşenleri
+### 2.1 Çekirdek Simülasyon Katmanı
+- **Zamanlayıcı:** Deterministik `FixedDeltaTimeScheduler` (tick) + adaptif `AsyncWorkQueue`.
+- **Dünya Temsili:** Bölgesel bölünmüş 3B grid (chunk tabanlı). Her chunk için veri:
+  - Statik geometri (`voxel_type`, `navmesh_id`).
+  - Dinamik durum (`temperature`, `water_level`, `resource_nodes`).
+- **Veri Yerelliği:** Her chunk için `SoA` (Structure of Arrays) yerleşimi ile cache hit oranı artırılacak.
 
-## monkey_patches/ace_storage_component.lua
-- **Sorun:** `storage_contains_filter_fn` ve `eval_best_passing_item` fonksiyonları neredeyse aynı mantığı tekrarlıyor; filtre önbelleği yönetimi karmaşık ve TODO açıklamasına göre performans darboğazı oluşturuyor.
-- **İhtiyaç:** Filtre sonuçları için ortak yardımcı fonksiyon çıkarılması, geçersiz varlıkların daha agresif temizlenmesi ve gerekirse artımlı değerlendirme stratejisi uygulanması.
-- **Beklenen Kazanç:** Depo filtrelemesi sırasında CPU kullanımının azalması ve daha az gecikme.
+### 2.2 AI Davranış Katmanı
+- **Karar Modeli:** Hedef odaklı planlama (GOAP) + hafif görev ağaçları.
+- **Plan Önişleme:** Ajansız `PlannerService` tik başına en fazla `N` plan hesaplayacak, geri kalanı ardışık iş kuyruğuna aktarılacak.
+- **Durumsal Bağlam:** `BlackboardComponent` aracılığıyla ajan başına minimal bellek ayak izi (sadece gerekli sensörler).
+- **Önceliklendirme:** `UtilityScore` tabanlı çok kriterli değerlendirme (sağlık, mesafe, kaynak kıtlığı).
 
-## monkey_patches/ace_water_component.lua
-- **Sorun:** Su kanalı hesaplamasında sabit değerler kod içine gömülü (`removal` değeri vb.) ve `csg::GetAdjacent` gibi daha uygun yardımcılar kullanılmıyor. Bölgesel güncellemeler sırasında manuel kenar yönetimi karmaşık ve hataya açık.
-- **İhtiyaç:** Sabitlerin yapılandırılabilir hâle getirilmesi, kenar belirleme için mevcut CSG yardımcılarının değerlendirilmesi ve ıslanma hacmi azaltma mantığının yeniden gözden geçirilmesi.
-- **Beklenen Kazanç:** Su fiziği güncellemelerinde tutarlılık, bakımı kolaylaştırma ve potansiyel performans iyileştirmesi.
+### 2.3 Kaynak ve Stok Yönetimi
+- **Veri Modeli:** `InventoryShard` yapısı ile koloni envanteri bölgelere ayrılır.
+- **Arama:** Her shard için kd-tree benzeri `SpatialIndex`. Aramalar `radius → filter` kombinasyonlarıyla logaritmik maliyetli olur.
+- **Kısıtlama:** Stok okunması snapshot üzerinden gerçekleşir, yazma işlemleri `CommandBuffer` ile tek tikte uygulanır.
 
-## monkey_patches/ace_hydrology_service.lua
-- **Sorun:** Su işlemcileri her tikte tek tek işleniyor; yorumlara göre net değişimlerin birleştirilmesi ve sıralı uygulama performansı artırabilir. Ayrıca minimum/maksimum yükseklik aralığı boş olduğunda gereksiz döngüler hâlâ çalıştırılabiliyor.
-- **İhtiyaç:** İşlemci değişikliklerini toplu hâlde işleyip tek seferde uygulayacak bir tampon katman tasarlamak; yükseklik aralığı doğrulamalarını erken çıkışlarla güçlendirmek.
-- **Beklenen Kazanç:** Statik su sistemlerinde belirgin performans artışı ve tik başına daha kısa işlem süresi.
+### 2.4 Görev Planlayıcı
+- **Kuyruklama:** `TaskStream` → `ReadyQueue` → `WorkerLane` aşamaları.
+- **Bekleme Analizi:** Her iş, hesaplanan CPU bütçesine göre `time_slice` etiketlenir. Limit aşılırsa görev bir sonraki tike sarkar.
+- **İptal/Öncelik Güncelleme:** Lock-free `ticket` sistemi; iptal isteği O(1) amorti.
 
-## services/server/inventory/restock_director.lua
-- **Sorun:** Errand değerlendirmesi sırasında `_is_errand_valid` çağrısı her denemede çalıştırılıyor; kodda bunun pahalı olabileceği belirtilmiş. Kuyruk ve önbellek yapıları karmaşık, hata durumlarında tekrar kuyruğa ekleme maliyetli.
-- **İhtiyaç:** Geçerlilik kontrollerini aksiyon başlangıcına erteleyip sonuçları daha uzun süre önbellekte tutmak veya artımlı doğrulama uygulamak. Hatalı maddeler için yeniden deneme sıklığını oyuncu ayarlarına bağlamak düşünülebilir.
-- **Beklenen Kazanç:** Dinamik stok yenileme sırasında işlem yükünün azalması ve iş kuyruğu gecikmelerinin düşmesi.
+### 2.5 Sistem Servisleri
+- **Navigasyon Servisi:** Dinamik navmesh güncellemeleri için `HierarchicalNavGraph`. Bariyer değişimlerinde lokal güncelleme.
+- **Olay Sistemi:** `EventBus` (tek yazarlı, çok okuyuculu halka tamponu). CPU yükünü azaltmak için `event coalescing`.
+- **Fizik / Çevre:** Su, ısı ve bitki büyümesi gibi sistemler `ComponentSystem` altında bağımsız modüller.
 
-## ai/lib/healing_lib.lua
-- **Sorun:** `make_healing_filter` her hedef için benzersiz filtre anahtarları üreterek çok sayıda AI filtresi oluşturuyor; yorum performans riskine işaret ediyor.
-- **İhtiyaç:** Filtre anahtarlarını normalleştirip gereksiz kombinasyonları azaltmak veya sonuçları belirli bir süre önbelleğe almak.
-- **Beklenen Kazanç:** Şifa işlevleri sırasında AI yükünün ve gereksiz filtre yaratımlarının azalması.
+## 3. CPU Optimizasyon İlkeleri
+1. **Çok Çekirdekli İşleme:**
+   - `WorkerPool` ile IO dışı tüm işler için çoklu iş parçacığı.
+   - `JobFence` ve `DependencyGraph` yardımıyla veri yarışları önlenir.
+2. **Cache Dostu Veri:**
+   - Sık erişilen veri yapıları (ajan konumları, görev slotları) için `Struct of Arrays`.
+   - `MemoryArena` ile sıcak veriyi tek blokta tutma.
+3. **Adaptif Update Frekansı:**
+   - Her servis kendine ait `update_budget_ms` belirler, aşılırsa güncelleme sıklığı azaltılır.
+   - Önemsiz simülasyonlar (ör. dekoratif animasyonlar) `N` tikte bir çalıştırılır.
+4. **Ölçüm ve Telemetri:**
+   - Her alt sistem için `FrameProfiler` kancaları.
+   - Canlı `PerfHUD` (ortalama tik süresi, görev kuyruğu uzunluğu).
+5. **İşlem Önceliği:**
+   - Ajansız (idle) ajanlar düşük öncelikli iş kuyruğuna taşınır.
+   - Kritik görevler (saldırı, yangın) gerçek zamanlı lane'e alınır.
 
-## services/client/heatmap/heatmap_service.lua
-- **Sorun:** Heatmap listesi JSON'dan tek seferlik okunuyor; TODO notu dinamik olarak eklenip kaldırılabilen ısı haritaları için datastore kullanımını öneriyor. Şu an yeni haritalar eklemek kod güncellemesi gerektiriyor.
-- **İhtiyaç:** Isı haritalarını konfigürasyon dosyası veya datastore aracılığıyla kayıt altına alacak esnek bir sistem kurmak ve UI'ya yeniden yükleme kabiliyeti eklemek.
-- **Beklenen Kazanç:** Modülerlik artışı ve yeni ısı haritalarını oyuna ekleme sürecinin kolaylaşması.
+## 4. Geliştirme Yol Haritası
+1. **Temel Altyapı (Sprint 1-2):**
+   - `FixedDeltaTimeScheduler`, `ChunkWorld` ve `EventBus` prototipleri.
+   - Profilleme altyapısı + ilk metrik panosu.
+2. **AI Çekirdeği (Sprint 3-4):**
+   - GOAP planlayıcı + `BlackboardComponent` temeli.
+   - 10 temel aksiyon (kazı, taşıma, inşa) için davranış şablonları.
+3. **Kaynak Yönetimi (Sprint 5):**
+   - `InventoryShard`, `SpatialIndex`, snapshot mekanizması.
+4. **Görev Planlayıcı (Sprint 6):**
+   - `TaskStream` → `WorkerLane` ardışık düzeni.
+   - CPU bütçesi takipleri ve önceliklendirme.
+5. **Çok Çekirdekli Yayılım (Sprint 7):**
+   - WorkerPool genişletme, veri yarışlarının giderilmesi.
+   - Kritik servislerde paralellik testleri.
+6. **Stres Test ve Optimizasyon (Sprint 8+):**
+   - 200/400 ajan senaryoları ile yük testleri.
+   - Profillerde %20'den fazla CPU kullanımına sahip modüller için hedefli iyileştirmeler.
 
-## Diğer İzlenimler
-- `renderers/connection`, `monkey_patches` ve `services` klasörleri yoğun olarak TODO ve performans yorumları içeriyor; düzenli bir teknik borç temizliği planlanmalı.
-- Global log çağrıları (`log:debug`, `log:spam`) üretim ortamında yüksek hacimli günlük oluşturabilir; yapılandırılabilir seviye eşikleri düşünülmeli.
+## 5. Teknik Standardizasyon
+- **Dil/Runtime:** C++20 veya Rust + Lua/AngelScript türü script katmanı.
+- **CI/CD:** Otomatik performans regresyon testi (benchmark sahneleri + başarım metrikleri).
+- **Kod Rehberi:**
+  - Çekirdek modüller için `noexcept` ve `constexpr` kullanımına öncelik.
+  - Script köprüsü için veri kopyası yerine `Handle`/`View` paylaşımlı yapılar.
 
+## 6. Kullanım Kolaylığı (Tooling)
+- **Geliştirici Konsolu:** Profil metrikleri, AI plan görselleştirici.
+- **Modlama API'sı:** Görev tanımları ve aksiyon ağaçları için deklaratif JSON + script hook'ları.
+- **Debug UI:**
+  - Anlık görev kuyruğu listesi.
+  - Ajan başına CPU bütçe tüketim grafiği.
+
+## 7. Riskler ve Alınacak Önlemler
+| Risk | Etki | Azaltma |
+| --- | --- | --- |
+| Çok çekirdekli eşzamanlılık hataları | Kritik (çökme/veri kaybı) | `ThreadSanitizer`, deterministik test senaryoları |
+| GOAP planlama maliyetleri | Orta (tik süresi artışı) | Plan cache, benzer hedefler için şablon reuse |
+| Veriye aç geliştirici araçları | Orta | UI prototiplerinin erken geliştirilmesi |
+
+## 8. Sonraki Adımlar
+1. Mimarinin bileşen diyagramını oluşturup ekip onayına sunmak.
+2. Prototip için küçük ölçekli (20 ajan) deneme sahnesi hazırlamak.
+3. Performans metriklerini CI pipeline'ına entegre etmek.
+
+Bu plan, AI merkezli yeni bir kolonizasyon simülasyon projesinin hem CPU kullanımını optimize edecek hem de geliştirici/oyuncu deneyimini kolaylaştıracak temel yapı taşlarını belirler.
